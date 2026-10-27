@@ -107,7 +107,7 @@ const $ = id => document.getElementById(id);
 const status = (s, type='') => { $('status').textContent=s; $('status').className='status '+type; };
 let ws, pc, dc, room='', role='', localStream=null, pendingCandidates=[], fileMeta=null, fileParts=[], receivedBytes=0, controlGranted=false, controlRequested=false;
 const config={iceServers:[{urls:'stun:stun.l.google.com:19302'}]};
-function wsUrl(){const endpoint=window.SIGNALING_SERVER_URL || '';return /^wss?:\/\//i.test(endpoint)?endpoint:'';}
+function wsUrl(){const endpoint=String(window.SIGNALING_SERVER_URL || '').trim();return /^wss?:\/\//i.test(endpoint)?endpoint:'';}
 function sendSignal(data){if(ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({room,...data}));}
 function setConnected(on){$('shareBtn').disabled=!on;$('hangupBtn').disabled=!on;$('sendBtn').disabled=!on || !dc || dc.readyState!=='open';$('fileBtn').disabled=!on || !dc || dc.readyState!=='open';$('requestControlBtn').disabled=!on || !dc || dc.readyState!=='open' || controlGranted || controlRequested;$('revokeControlBtn').disabled=!controlGranted;}
 function setControlState(text,kind=''){ $('controlState').textContent=text; $('controlDot').className='dot'+(kind?' '+kind:''); $('videoWrap').classList.toggle('control-active',controlGranted); $('revokeControlBtn').disabled=!controlGranted; $('requestControlBtn').disabled=!(pc && pc.connectionState==='connected' && dc && dc.readyState==='open') || controlGranted || controlRequested; }
@@ -115,7 +115,7 @@ function sendData(message){if(dc && dc.readyState==='open')dc.send(JSON.stringif
 function clearControl(){controlGranted=false;controlRequested=false;$('consentPanel').classList.remove('show');setControlState('Uzaktan kontrol kapalı');}
 function connectSocket(){
   const endpoint=wsUrl();
-  if(!endpoint){status('GitHub Pages arayüzü hazır. Önce signaling-server sunucusunu yayınlayıp config.js içine WSS adresini yazın.','err');return;}
+  if(!endpoint){status('Sinyal sunucusu ayarlı değil. config.js dosyasına çalışan WebSocket/WSS adresini yazın; bu ayar olmadan cihazlar bağlanamaz ve ekran paylaşımı çalışmaz.','err');$('createBtn').disabled=true;$('joinBtn').disabled=true;return;}
   ws=new WebSocket(endpoint);
   ws.onopen=()=>status('Sunucuya bağlandı. Destek kodu oluşturabilir veya kod girebilirsiniz.','ok');
   ws.onclose=()=>{status('Sunucu bağlantısı kesildi. Sayfayı yenileyip tekrar deneyin.','err');cleanupPeer(false)};
@@ -133,11 +133,13 @@ function connectSocket(){
 function makePeer(){
   pc=new RTCPeerConnection(config);
   pc.onicecandidate=e=>{if(e.candidate)sendSignal({type:'signal',data:{candidate:e.candidate}})};
-  pc.onconnectionstatechange=()=>{if(!pc)return; if(pc.connectionState==='connected'){status('Cihazlar birbirine bağlandı.','ok');setConnected(true)} if(['failed','disconnected','closed'].includes(pc.connectionState)){if(pc.connectionState!=='disconnected')status('Bağlantı sonlandı.','err')}};
+  pc.onconnectionstatechange=()=>{if(!pc)return; if(pc.connectionState==='connected'){status('Cihazlar birbirine bağlandı. Ekran paylaşımı için Paylaş düğmesine basın.','ok');setConnected(true)} if(pc.connectionState==='failed'){status('WebRTC bağlantısı kurulamadı. Ağınız TURN sunucusu gerektiriyor olabilir; ayrıca WSS adresini ve sunucuyu kontrol edin.','err');setConnected(false)} if(pc.connectionState==='disconnected'){status('Bağlantı geçici olarak kesildi; tekrar bağlanması bekleniyor…','err')} if(pc.connectionState==='closed'){setConnected(false)}};
+  pc.oniceconnectionstatechange=()=>{if(pc && pc.iceConnectionState==='failed')status('ICE bağlantısı başarısız. Farklı ağlarda TURN sunucusu gerekebilir.','err')};
   pc.ontrack=e=>{
     let v=document.getElementById('remoteVideo');
     if(!v){$('videoWrap').innerHTML='<video id="remoteVideo" autoplay playsinline controls></video>';v=$('remoteVideo')}
-    v.srcObject=e.streams[0];
+    v.srcObject=(e.streams && e.streams[0]) ? e.streams[0] : new MediaStream([e.track]);
+    v.play().catch(()=>{status('Karşı ekran geldi; video oynatımı için görüntü alanına dokunun.','err')});
   };
   pc.ondatachannel=e=>{dc=e.channel;setupDataChannel()};
 }
@@ -192,12 +194,16 @@ $('joinBtn').onclick=()=>{const c=$('joinCode').value.replace(/\D/g,'');if(c.len
 $('shareBtn').onclick=async()=>{
   if(!pc)return;
   try{
-    localStream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:false});
-    localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia){throw new Error('Tarayıcı ekran paylaşımını desteklemiyor veya sayfa güvenli bağlamda değil. HTTPS üzerinden açın ya da bilgisayarda localhost kullanın.')}
+    if(pc.signalingState!=='stable')throw new Error('Bağlantı görüşmesi sürüyor. Birkaç saniye bekleyip yeniden deneyin.');
+    localStream=await navigator.mediaDevices.getDisplayMedia({video:{frameRate:15},audio:false});
+    const tracks=localStream.getVideoTracks();
+    if(!tracks.length)throw new Error('Paylaşılacak ekran akışı alınamadı.');
+    tracks.forEach(t=>pc.addTrack(t,localStream));
     const offer=await pc.createOffer();await pc.setLocalDescription(offer);sendSignal({type:'signal',data:{description:pc.localDescription}});
-    $('stopShareBtn').disabled=false;localStream.getVideoTracks()[0].onended=stopShare;
-    status('Ekranınız paylaşılıyor.','ok');
-  }catch(e){status('Ekran paylaşımı başlatılamadı: '+e.message,'err')}
+    $('stopShareBtn').disabled=false;tracks[0].onended=stopShare;
+    status('Ekran paylaşımı başlatıldı; karşı cihazın görüntüyü alması bekleniyor.','ok');
+  }catch(e){if(localStream){localStream.getTracks().forEach(t=>t.stop());localStream=null}status('Ekran paylaşımı başlatılamadı: '+(e.name==='NotAllowedError'?'Ekran paylaşım izni verilmedi veya seçim iptal edildi.':e.message),'err')}
 };
 async function stopShare(){if(localStream){localStream.getTracks().forEach(t=>t.stop());localStream=null}if(pc){pc.getSenders().filter(s=>s.track&&s.track.kind==='video').forEach(s=>{try{pc.removeTrack(s)}catch(e){}});try{if(pc.signalingState==='stable'){const offer=await pc.createOffer();await pc.setLocalDescription(offer);sendSignal({type:'signal',data:{description:pc.localDescription}})}}catch(e){console.warn('Paylaşımı durdurma görüşmesi:',e)}}$('stopShareBtn').disabled=true;status('Ekran paylaşımı durduruldu.','ok');}
 $('stopShareBtn').onclick=stopShare;
